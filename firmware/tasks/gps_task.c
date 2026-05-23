@@ -2,11 +2,10 @@
  * Task: GPS Parsing
  * Protocol: NMEA 0183 via UART at 9600 baud
  * Fix 1: strtok replaced with strtok_r (thread-safe)
- * Fix 2: Fault logic removed — fault_task.c owns all timeouts.
- *        GPS task has ONE job: parse sentence, pet watchdog.
- *        If GPS goes silent, fault_task detects the timeout
- *        automatically because FAULT_UpdateGPSTick() stops
- *        being called. Clean separation of responsibilities.
+ * Fix 2: Fault logic removed — fault_task.c owns all timeouts
+ * Fix 3: Explicit null termination after strncpy — if source
+ *        fills entire buffer, strncpy won't add \0, causing
+ *        strtok_r to march past the array into random RAM.
  * ============================================================= */
 
 #include "FreeRTOS.h"
@@ -16,14 +15,20 @@
 #include <stdlib.h>
 
 #define NMEA_BUF_SIZE  128
-#define GPS_READ_MS    1000   /* How long to wait for a sentence */
+#define GPS_READ_MS    1000
 
 static int parse_GPRMC(const char *sentence, GPS_Data_t *out) {
     char  buf[NMEA_BUF_SIZE];
-    char *saveptr = NULL;   /* strtok_r state — lives on stack, thread-safe */
+    char *saveptr = NULL;
 
+    /* ── Safe copy with guaranteed null termination ───────────
+     * strncpy copies up to NMEA_BUF_SIZE-1 characters.
+     * The final byte is then EXPLICITLY set to '\0'.
+     * This is safe even if sentence fills the entire buffer.
+     * Without this, a 128-byte malformed frame has NO null
+     * terminator and strtok_r walks into undefined memory.    */
     strncpy(buf, sentence, NMEA_BUF_SIZE - 1);
-    buf[NMEA_BUF_SIZE - 1] = '\0';
+    buf[NMEA_BUF_SIZE - 1] = '\0';  /* always force null terminator */
 
     char *token = strtok_r(buf, ",", &saveptr);
     if (!token || strcmp(token, "$GPRMC") != 0) return -1;
@@ -76,29 +81,25 @@ void vTaskGPSParsing(void *pvParameters) {
     char       nmea_buf[NMEA_BUF_SIZE];
     GPS_Data_t gps_data;
 
+    /* ── Also null-terminate the receive buffer at init ────────
+     * Prevents reading garbage if UART_ReadLine returns partial
+     * data on first call before the buffer is ever written     */
+    memset(nmea_buf, 0, sizeof(nmea_buf));
+
     for (;;) {
-        /* Block waiting for one NMEA sentence from UART */
         int len = UART_ReadLine(GPS_UART_PORT, nmea_buf,
-                                NMEA_BUF_SIZE,
+                                NMEA_BUF_SIZE - 1,
                                 pdMS_TO_TICKS(GPS_READ_MS));
 
-        /* ── No sentence received ─────────────────────────────
-         * We do NOT call FAULT_Set() here anymore.
-         * We simply do nothing — FAULT_UpdateGPSTick() won't
-         * be called, so fault_task.c will detect the silence
-         * after GPS_TIMEOUT_MS and trigger the fault itself.
-         * One place owns fault logic. No duplication.         */
         if (len <= 0) continue;
 
-        /* ── Parse only $GPRMC sentences ── */
+        /* Force null termination on received data too */
+        nmea_buf[len] = '\0';
+
         if (strncmp(nmea_buf, "$GPRMC", 6) != 0) continue;
 
         int result = parse_GPRMC(nmea_buf, &gps_data);
 
-        /* ── Valid fix received ───────────────────────────────
-         * Pet the watchdog — this is the GPS task's ONLY job.
-         * fault_task.c sees the tick update and knows GPS is
-         * alive. If we stop calling this, fault triggers.     */
         if (result == 1 && gps_data.fix_valid) {
             gps_data.timestamp_ms = xTaskGetTickCount();
             FAULT_UpdateGPSTick();
