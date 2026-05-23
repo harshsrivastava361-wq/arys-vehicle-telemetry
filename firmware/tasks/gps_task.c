@@ -1,11 +1,12 @@
 /* =============================================================
  * Task: GPS Parsing
  * Protocol: NMEA 0183 via UART at 9600 baud
- * Fix: Replaced strtok() with strtok_r() for thread safety
- *      strtok() uses internal static state — if RTOS preempts
- *      mid-parse, the pointer corrupts and causes HardFault.
- *      strtok_r() takes a caller-supplied saveptr, making it
- *      fully reentrant and safe in an RTOS environment.
+ * Fix 1: strtok replaced with strtok_r (thread-safe)
+ * Fix 2: Fault logic removed — fault_task.c owns all timeouts.
+ *        GPS task has ONE job: parse sentence, pet watchdog.
+ *        If GPS goes silent, fault_task detects the timeout
+ *        automatically because FAULT_UpdateGPSTick() stops
+ *        being called. Clean separation of responsibilities.
  * ============================================================= */
 
 #include "FreeRTOS.h"
@@ -13,30 +14,26 @@
 #include "queue.h"
 #include <string.h>
 #include <stdlib.h>
-#include <stdio.h>
 
-#define GPS_TIMEOUT_MS  2000
-#define NMEA_BUF_SIZE   128
+#define NMEA_BUF_SIZE  128
+#define GPS_READ_MS    1000   /* How long to wait for a sentence */
 
 static int parse_GPRMC(const char *sentence, GPS_Data_t *out) {
-    char buf[NMEA_BUF_SIZE];
+    char  buf[NMEA_BUF_SIZE];
+    char *saveptr = NULL;   /* strtok_r state — lives on stack, thread-safe */
+
     strncpy(buf, sentence, NMEA_BUF_SIZE - 1);
     buf[NMEA_BUF_SIZE - 1] = '\0';
-
-    /* ── saveptr is LOCAL to this function call ───────────────
-     * Each call to parse_GPRMC gets its own saveptr on the
-     * stack. No shared static state = no concurrency crash.   */
-    char *saveptr = NULL;
 
     char *token = strtok_r(buf, ",", &saveptr);
     if (!token || strcmp(token, "$GPRMC") != 0) return -1;
 
-    /* Time field: HHMMSS.ss */
+    /* Time: HHMMSS.ss */
     token = strtok_r(NULL, ",", &saveptr);
     if (!token) return -1;
     out->utc_time = atof(token);
 
-    /* Status: A=valid, V=invalid */
+    /* Status: A=valid V=void */
     token = strtok_r(NULL, ",", &saveptr);
     if (!token || *token != 'A') {
         out->fix_valid = 0;
@@ -48,10 +45,9 @@ static int parse_GPRMC(const char *sentence, GPS_Data_t *out) {
     token = strtok_r(NULL, ",", &saveptr);
     if (!token) return -1;
     double raw_lat = atof(token);
-    int lat_deg = (int)(raw_lat / 100);
-    out->latitude = lat_deg + (raw_lat - lat_deg * 100) / 60.0;
+    int lat_deg    = (int)(raw_lat / 100);
+    out->latitude  = lat_deg + (raw_lat - lat_deg * 100) / 60.0;
 
-    /* N/S hemisphere */
     token = strtok_r(NULL, ",", &saveptr);
     if (token && *token == 'S') out->latitude *= -1;
 
@@ -59,18 +55,17 @@ static int parse_GPRMC(const char *sentence, GPS_Data_t *out) {
     token = strtok_r(NULL, ",", &saveptr);
     if (!token) return -1;
     double raw_lon = atof(token);
-    int lon_deg = (int)(raw_lon / 100);
+    int lon_deg    = (int)(raw_lon / 100);
     out->longitude = lon_deg + (raw_lon - lon_deg * 100) / 60.0;
 
-    /* E/W hemisphere */
     token = strtok_r(NULL, ",", &saveptr);
     if (token && *token == 'W') out->longitude *= -1;
 
-    /* Speed in knots → km/h */
+    /* Speed knots → km/h */
     token = strtok_r(NULL, ",", &saveptr);
     if (token) out->speed_kmh = atof(token) * 1.852f;
 
-    /* Course over ground (heading) */
+    /* Heading */
     token = strtok_r(NULL, ",", &saveptr);
     if (token) out->heading = atof(token);
 
@@ -82,27 +77,32 @@ void vTaskGPSParsing(void *pvParameters) {
     GPS_Data_t gps_data;
 
     for (;;) {
+        /* Block waiting for one NMEA sentence from UART */
         int len = UART_ReadLine(GPS_UART_PORT, nmea_buf,
                                 NMEA_BUF_SIZE,
-                                pdMS_TO_TICKS(GPS_TIMEOUT_MS));
+                                pdMS_TO_TICKS(GPS_READ_MS));
 
-        if (len <= 0) {
-            /* Timeout — no valid sentence received */
-            gps_data.fix_valid = 0;
-            FAULT_Set(FAULT_GPS_TIMEOUT);
+        /* ── No sentence received ─────────────────────────────
+         * We do NOT call FAULT_Set() here anymore.
+         * We simply do nothing — FAULT_UpdateGPSTick() won't
+         * be called, so fault_task.c will detect the silence
+         * after GPS_TIMEOUT_MS and trigger the fault itself.
+         * One place owns fault logic. No duplication.         */
+        if (len <= 0) continue;
+
+        /* ── Parse only $GPRMC sentences ── */
+        if (strncmp(nmea_buf, "$GPRMC", 6) != 0) continue;
+
+        int result = parse_GPRMC(nmea_buf, &gps_data);
+
+        /* ── Valid fix received ───────────────────────────────
+         * Pet the watchdog — this is the GPS task's ONLY job.
+         * fault_task.c sees the tick update and knows GPS is
+         * alive. If we stop calling this, fault triggers.     */
+        if (result == 1 && gps_data.fix_valid) {
+            gps_data.timestamp_ms = xTaskGetTickCount();
+            FAULT_UpdateGPSTick();
             xQueueSend(xGPSQueue, &gps_data, 0);
-            continue;
-        }
-
-        if (strncmp(nmea_buf, "$GPRMC", 6) == 0) {
-            if (parse_GPRMC(nmea_buf, &gps_data) == 1
-                    && gps_data.fix_valid) {
-                gps_data.timestamp_ms = xTaskGetTickCount();
-                FAULT_Clear(FAULT_GPS_TIMEOUT);
-                /* Pet the watchdog so fault monitor knows GPS is alive */
-                FAULT_UpdateGPSTick();
-                xQueueSend(xGPSQueue, &gps_data, 0);
-            }
         }
     }
 }
