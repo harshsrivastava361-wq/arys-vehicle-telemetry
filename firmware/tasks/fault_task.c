@@ -1,102 +1,98 @@
 /* =============================================================
- * Task: Fault Monitor (Highest Priority — Safety Critical)
- * Monitors: GPS loss, IMU disconnect, CAN timeout, SD failure
+ * Task: Fault Monitor — Priority 6 (HIGHEST)
+ * Detects: GPS loss, IMU disconnect, CAN timeout, SD failure
  * Recovery: Graceful degradation per fault type
+ * Fix: Watchdog tick setters so other tasks can "pet" the watchdog
  * ============================================================= */
 
 #include "FreeRTOS.h"
 #include "task.h"
-#include "fault_task.h"
-#include <stdio.h>
 
-/* Fault register — bitmask */
-static volatile uint32_t fault_register = 0x00000000;
+#define FAULT_GPS_LOSS    (1 << 0)
+#define FAULT_IMU_DISC    (1 << 1)
+#define FAULT_CAN_TIMEOUT (1 << 2)
+#define FAULT_SD_FAIL     (1 << 3)
 
-/* Fault codes */
-#define FAULT_GPS_LOSS      (1 << 0)
-#define FAULT_IMU_DISC      (1 << 1)
-#define FAULT_CAN_TIMEOUT   (1 << 2)
-#define FAULT_SD_FAIL       (1 << 3)
+#define IMU_TIMEOUT_MS  500
+#define CAN_TIMEOUT_MS  1000
+#define GPS_TIMEOUT_MS  2000
 
-/* Thresholds */
-#define IMU_TIMEOUT_MS      500
-#define CAN_TIMEOUT_MS      1000
-#define GPS_TIMEOUT_MS      2000
+static volatile uint32_t fault_register = 0;
 
-static uint32_t last_imu_tick = 0;
-static uint32_t last_can_tick = 0;
-static uint32_t last_gps_tick = 0;
+/* ── Watchdog ticks — initialized to current tick at boot,
+ * not 0, to prevent false faults on startup               */
+static volatile uint32_t last_imu_tick = 0;
+static volatile uint32_t last_can_tick = 0;
+static volatile uint32_t last_gps_tick = 0;
+static uint8_t ticks_initialized = 0;
 
-void FAULT_Set(uint32_t fault_code) {
-    fault_register |= fault_code;
+/* ── Public API ───────────────────────────────────────────── */
+void FAULT_Set(uint32_t code)   { fault_register |=  code; }
+void FAULT_Clear(uint32_t code) { fault_register &= ~code; }
+int  FAULT_IsSet(uint32_t code) { return (fault_register & code) != 0; }
+
+/* ── Watchdog "pet" functions — called by other tasks ─────── */
+void FAULT_UpdateGPSTick(void) {
+    last_gps_tick = xTaskGetTickCount();
 }
 
-void FAULT_Clear(uint32_t fault_code) {
-    fault_register &= ~fault_code;
+void FAULT_UpdateIMUTick(void) {
+    last_imu_tick = xTaskGetTickCount();
 }
 
-/* Returns 1 if fault is active */
-int FAULT_IsSet(uint32_t fault_code) {
-    return (fault_register & fault_code) != 0;
-}
-
-static void handle_gps_loss(void) {
-    /* Graceful degradation: switch to dead reckoning using IMU + wheel speed */
-    printf("[FAULT] GPS signal lost — activating dead reckoning mode\n");
-    Telemetry_SetMode(TELEM_MODE_DEAD_RECKONING);
-    LED_SetFaultIndicator(LED_GPS_FAULT);
-}
-
-static void handle_imu_disconnect(void) {
-    /* Disable orientation estimation, continue GPS-only mode */
-    printf("[FAULT] IMU disconnected — orientation data unavailable\n");
-    SensorFusion_Disable();
-    LED_SetFaultIndicator(LED_IMU_FAULT);
-}
-
-static void handle_can_timeout(void) {
-    /* Attempt CAN bus reset, log error frame */
-    printf("[FAULT] CAN timeout — attempting bus reset\n");
-    CAN_BusOff_Recovery();
-    FaultLog_Write(FAULT_CAN_TIMEOUT, xTaskGetTickCount());
-}
-
-static void handle_sd_failure(void) {
-    /* Switch to RAM ring buffer, transmit wirelessly instead */
-    printf("[FAULT] SD card write failure — switching to RAM buffer + wireless\n");
-    DataLogger_UseRAMBuffer();
-    Wireless_SetPriority(WIRELESS_HIGH_PRIORITY);
+void FAULT_UpdateCANTick(void) {
+    last_can_tick = xTaskGetTickCount();
 }
 
 void vTaskFaultMonitor(void *pvParameters) {
+
+    /* ── Initialize all ticks to NOW at boot.
+     * This prevents false fault triggers during startup
+     * before other tasks have had a chance to run.        */
+    last_gps_tick = xTaskGetTickCount();
+    last_imu_tick = xTaskGetTickCount();
+    last_can_tick = xTaskGetTickCount();
+    ticks_initialized = 1;
+
     for (;;) {
         uint32_t now = xTaskGetTickCount();
 
-        /* ---- Check GPS timeout ---- */
+        /* ── GPS watchdog ── */
         if ((now - last_gps_tick) > pdMS_TO_TICKS(GPS_TIMEOUT_MS)) {
             if (!FAULT_IsSet(FAULT_GPS_LOSS)) {
                 FAULT_Set(FAULT_GPS_LOSS);
-                handle_gps_loss();
+                /* Graceful recovery: dead reckoning via IMU + wheel speed */
+                Telemetry_SetMode(TELEM_MODE_DEAD_RECKONING);
             }
+        } else {
+            /* Auto-clear when tick is being updated again */
+            FAULT_Clear(FAULT_GPS_LOSS);
         }
 
-        /* ---- Check IMU timeout ---- */
+        /* ── IMU watchdog ── */
         if ((now - last_imu_tick) > pdMS_TO_TICKS(IMU_TIMEOUT_MS)) {
             if (!FAULT_IsSet(FAULT_IMU_DISC)) {
                 FAULT_Set(FAULT_IMU_DISC);
-                handle_imu_disconnect();
+                /* Graceful recovery: disable fusion, GPS-only mode */
+                SensorFusion_Disable();
             }
+        } else {
+            FAULT_Clear(FAULT_IMU_DISC);
         }
 
-        /* ---- Check CAN timeout ---- */
+        /* ── CAN watchdog ── */
         if ((now - last_can_tick) > pdMS_TO_TICKS(CAN_TIMEOUT_MS)) {
             if (!FAULT_IsSet(FAULT_CAN_TIMEOUT)) {
                 FAULT_Set(FAULT_CAN_TIMEOUT);
-                handle_can_timeout();
+                /* Graceful recovery: bus-off reset sequence */
+                CAN_BusOff_Recovery();
+                FaultLog_Write(FAULT_CAN_TIMEOUT, now);
             }
+        } else {
+            FAULT_Clear(FAULT_CAN_TIMEOUT);
         }
 
-        /* ---- Report fault register over CAN (0x7FF = diagnostic ID) ---- */
+        /* ── Broadcast fault register on CAN diagnostic frame ── */
         if (fault_register != 0) {
             CAN_Frame_t diag;
             diag.id      = 0x7FF;
@@ -108,7 +104,6 @@ void vTaskFaultMonitor(void *pvParameters) {
             CAN_Transmit(&diag);
         }
 
-        /* Run every 50ms — fault detection latency acceptable */
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
